@@ -89,7 +89,7 @@ python tools/train.py \
 | 指标 | 数值 |
 |---|---|
 | 能否在 NPU 跑通 | 推理/评估能跑通。训练原始入口不能直接跑;适配后仅声明标准 YOLOv6-N、单 NPU、FP32、1 epoch 功能验证链路通过,覆盖 forward/backward/optimizer/save/final eval。不声明 AMP、多卡、resume、distill、QAT/quant、全量 COCO 训练和多 epoch 收敛可用。 |
-| NPU 利用率 (npu-smi) | 未采集稳定利用率曲线;npu-smi 用于确认设备可见性与无残留进程。AIC/AIV/MTE 利用率待 STARS/torch_npu profiler 补测。 |
+| NPU 利用率 (npu-smi) | 未采集稳定利用率曲线;npu-smi 仅用于确认设备可见性与无残留进程。AIC/AIV/MTE 利用率应按注入式 `torch_npu.profiler` 补测。 |
 | HBM 占用 | 单卡 HBM 114688MB;YOLOv6-N 峰值 HBM 未单独采样,待 profiler 补测。 |
 | 关键算子是否回退 CPU | 推理主体无关键 CPU 回退;NMS 回退 CPU;pycocotools 指标统计在 CPU。训练功能验证在 float32 assigner 修正后未观察到 label assignment CPU fallback,但未用 profiler 排查全部 backward kernel。 |
 | 性能(吞吐/时延) | FP32 inference 0.30 ms/image;FP16 inference 0.20 ms/image;CPU NMS 在 speed 阈值下约 0.9 ms/image,在 COCO val 低阈值下 149.31 ms/image。训练功能验证样本太小,不作为吞吐、收敛或资源占用指标。 |
@@ -114,7 +114,10 @@ python tools/train.py \
   - OpenCV/letterbox/preprocess:host 侧处理,当前耗时很小,不是主要瓶颈。
   - 训练 label assignment:原始 NPU 补丁下因 `DT_DOUBLE` 输入触发 NPU `Min` 不支持并回退 CPU;固定 `loss.preprocess()` 为 `float32` 后,单卡训练功能验证未再回退。
 - profiler 摘要:
-  - 未采集完整 STARS/torch_npu profiler。现有日志只提供 preprocess、inference、NMS 三段时间和训练单卡功能通过证据。AIC/AIV/MTE、tile 驻留、NDDMA/CV fusion、训练 backward/assigner 热点均为待测。
+  - 仓内未发现 `enable_profiler`、`tensorboard_trace_handler` 或 `torch_npu.profiler` 内置采集入口,因此 profiling 路由应走注入采集。采集时在目标 loop 外先做一次模型预热,再用 `torch_npu.profiler.profile` 注入推理 forward 或训练 step。
+  - profiler 配置必须包含 `torch_npu.profiler._ExperimentalConfig(profiler_level=Level1, aic_metrics=PipeUtilization)`,否则 `kernel_details.csv` 只有基础 9 列,无法分析 Cube/Vector/MTE pipeline utilization。schedule 建议 `wait=0,warmup=0,active=N,repeat=1,skip_first=0`,循环中每步 `torch.npu.synchronize(); prof.step()`,循环结束额外调用一次 `prof.step()` 触发收尾。
+  - 产物验收标准:生成 `ASCEND_PROFILER_OUTPUT/`;`kernel_details.csv` 约 47 列;`op_statistic.csv`、`api_statistic.csv`、`operator_details.csv`、`step_trace_time.csv` 存在;`trace_view.json` 为合法 JSON。若 CSV 缺失或 `trace_view.json` 截断,优先排查输出目录所在文件系统并换盘重采/重解析,不要把大体量产物长期留在系统盘。
+  - 现有日志只提供 preprocess、inference、NMS 三段时间和训练单卡功能通过证据。AIC/AIV/MTE、tile 驻留、NDDMA/CV fusion、训练 backward/assigner 热点均为待测。
 
 ## 5. 阻塞项
 | 阻塞点 | 原因 | 是否硬阻塞 | CANN/AscendC 替代方案 | 兜底 |
@@ -125,14 +128,14 @@ python tools/train.py \
 | head 末端 layout 与小 kernel | reshape/permute/cat/dist2bbox/NMS prep 在 eager 下产生多段小算子与物化 | 非硬阻塞 | 固定 `(N, HW, C)` 物理布局,用 NDDMA/address generation 折叠转换,将 decode 融入后处理 | 继续 eager 执行 |
 | 旧权重序列化结构 | 官方权重保存旧 class/属性,直接用 v0.4.0 代码加载会失败 | 非硬阻塞,已用兼容 shim 解决 | 重新导出标准 state_dict 或 ONNX,减少 Python class 依赖 | 保留兼容 shim |
 | 全模型矩阵未补齐 | 本轮完整 COCO val 只跑 YOLOv6-N | 非硬阻塞 | 逐个补 YOLOv6-S/M/L 与 P6 1280 输入;采集 profiler | 当前只声明 YOLOv6-N |
-| HBM/利用率未 profile | npu-smi 未采稳定利用率曲线 | 非硬阻塞 | STARS/torch_npu profiler 采 AIC/AIV/MTE、kernel timeline、HBM 峰值 | 用日志三段耗时做初判 |
+| HBM/利用率未 profile | npu-smi 未采稳定利用率曲线,且尚未生成 profiler CSV | 非硬阻塞 | 注入 `torch_npu.profiler` 并使用 Level1 + PipeUtilization,验收 `kernel_details.csv` 约 47 列、`op_statistic.csv`、`api_statistic.csv` 与合法 `trace_view.json` | 用日志三段耗时做初判 |
 
 ## 6. 结论
 - 运行方案(NPU / NPU+CPU / CPU):NPU+CPU。YOLOv6-N 推理主体在 NPU 上跑通且亲和,COCO mAP 与 README 基准对齐;NMS 与 COCO metric 当前在 CPU。训练原始入口不支持 NPU;适配后仅证明标准 YOLOv6-N、单 NPU、FP32、1 epoch、8 train + 4 val 的功能验证链路可执行,覆盖 forward/backward/optimizer step/save/final eval,不能外推为全量训练、AMP、多卡、resume、distill、QAT/quant 或多 epoch 收敛可用。
 - 待办 / 风险:
   - 优先替换 CPU NMS。只优化卷积主体不能解决端到端检测耗时。
   - 训练需要作为单独适配重点:清理 CUDA 绑定,补 torch_npu AMP 或明确 FP32 训练策略,对 assigner/loss 建单测,再补多 epoch 稳定性。
-  - 补 STARS/torch_npu profiler,确认 Cube/Vector/MTE/host/head 实际占比、训练 backward/assigner 热点与 HBM 峰值。
+  - 按注入式 `torch_npu.profiler` 方法补采 profiler,确认 Cube/Vector/MTE/host/head 实际占比、训练 backward/assigner 热点与 HBM 峰值。
   - 补 FP16 COCO mAP,当前 FP16 只跑了 speed。
   - 补 YOLOv6-S/M/L 和 P6 1280 输入矩阵,不能把 YOLOv6-N 结果外推到全系列。
   - 补测 AMP/GradScaler、DDP/HCCL、resume、distill、fuse_ab、QAT/quant、全量 COCO train2017 和多 epoch 稳定性。本轮未执行这些训练分支,因此只能记录为未覆盖测试项,不能写成已确认阻塞。
