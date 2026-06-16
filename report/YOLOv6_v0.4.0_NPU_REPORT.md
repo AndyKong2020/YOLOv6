@@ -80,7 +80,7 @@ python tools/eval.py \
 ```
 
 ## 3. 验证用例
-- 输入数据:COCO val2017,共 5000 张图片;P5 输入尺寸 640,batch size 32。训练功能验证另用 8 张 train + 4 张 val 的小子集,只验证训练程序路径是否可执行,不代表训练精度或收敛性。挂载数据中未发现 COCO train2017,因此未做全量收敛训练,该项不是 NPU 阻塞。
+- 输入数据:COCO val2017,共 5000 张图片;P5 输入尺寸 640,batch size 32。训练功能验证另用 8 张 train + 4 张 val 的小子集,只验证训练程序路径是否可执行,不代表训练精度或收敛性。
 - 运行命令:见第 2 节,覆盖 COCO val FP32/FP16、P5/P6 全权重 speed、标准训练 2 epoch、resume、fuse_ab、distill、DDP 启动与 profiler。
 - 期望输出:README 中 YOLOv6-N mAP<sup>val 0.5:0.95</sup> 为 37.5;官方 speed 文档说明公平测速不包含 preprocess 与 NMS。
 - 实测输出:
