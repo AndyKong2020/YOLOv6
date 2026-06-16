@@ -9,7 +9,7 @@
 | 报告人 | - |
 | 日期 | 2026-06-16 |
 | 硬件 | Ascend 950PR ×8 / CANN 9.0.0 |
-| 软件 | torch 2.10.0+cpu / torch_npu 2.10.0 / torchvision 0.25.0 / Python 3.12.13 |
+| 软件 | torch 2.10.0+cpu / torch_npu 2.10.0 / torchvision 0.25.0+cpu / Python 3.12.13 |
 
 ---
 
@@ -17,8 +17,8 @@
 - 主语言:Python。
 - ML 框架:PyTorch。评估入口为 `tools/eval.py`,COCO 指标走 `pycocotools`。
 - CUDA 依赖:原始 v0.4.0 评估与训练代码均默认 CUDA。评估侧默认 CUDA 设备与 `torchvision.ops.nms`;训练侧 `select_device`、AMP/GradScaler、loss、empty_cache、DDP、distill/fuse_ab 分支均有 CUDA 绑定。标准训练、resume、distill、fuse_ab、DDP 入口均已执行,阻塞项只记录实测失败路径。
-- 自定义核(.cu / C++ 扩展):无必须编译的自定义 CUDA 扩展。当前阻塞来自 `torchvision::nms` 在本 torch/torchvision/torch_npu 组合中不可用,不是项目自带 .cu 编译失败。
-- 第三方库:opencv-python-headless、pycocotools、thop、onnx/onnxsim、tensorboard 等。`torchvision` 可安装但 NMS op 不可用。
+- 自定义核(.cu / C++ 扩展):无必须编译的自定义 CUDA 扩展。当前后处理瓶颈来自 `torchvision::nms` 无 NPU dispatch kernel,不是项目自带 .cu 编译失败。
+- 第三方库:opencv-python-headless、pycocotools、thop、onnx/onnxsim、tensorboard 等。`torchvision 0.25.0+cpu` 可加载 CPU custom ops,`torchvision::nms` 具备 CPU/Meta kernel,无 NPU kernel。
 - 模型权重 / 来源:YOLOv6 v0.4.0 release 官方权重。完整 COCO val 复现使用 `yolov6n.pt`;P5/P6 全部官方权重已完成 speed 可运行矩阵。
 
 ## 2. 部署步骤
@@ -26,7 +26,7 @@
 - [x] 编译 / 构建:无需编译项目本体;以源码方式运行评估入口。
 - [x] 权重获取:下载 v0.4.0 官方 P5/P6 权重,完整复现选择 YOLOv6-N。
 - [x] 数据准备:COCO val2017 图片 5000 张,由 `instances_val2017.json` 生成 YOLO 格式 val label 5000 个。
-- [x] NPU 适配改动(device、torch_npu、禁用 CUDA 核等):评估入口支持 NPU 设备;checkpoint 先 CPU 加载再迁移;PyTorch 2.6+ checkpoint 加载显式兼容;旧权重序列化 `Conv`、`SimConv`、`Conv_C3` 等 class/属性增加 shim;NMS 在 `torchvision.ops.nms` 不可用时走 CPU fallback。
+- [x] NPU 适配改动(device、torch_npu、禁用 CUDA 核等):评估入口支持 NPU 设备;checkpoint 先 CPU 加载再迁移;PyTorch 2.6+ checkpoint 加载显式兼容;旧权重序列化 `Conv`、`SimConv`、`Conv_C3` 等 class/属性增加 shim;NMS 因缺 NPU kernel 走 CPU fallback。
 - [x] 训练单卡功能验证适配:标准 YOLOv6-N、单 NPU、FP32、2 epoch 功能验证链路通过。已覆盖 data loader、forward、loss/assigner、backward、optimizer step、checkpoint save、final eval、未 strip 中间 checkpoint resume。
 - [x] profiler 采集:仓内无内置 profiler,按注入式 `torch_npu.profiler` 采集 YOLOv6-N FP16 forward 与 FP32 train step,使用 Level1 + PipeUtilization,并验收 profiler CSV/JSON 产物。
 - 命令:
@@ -134,7 +134,7 @@ python tools/eval.py \
 **判定**:YOLOv6-N 的网络主体亲和 NPU。按 950PR FP16 Cube 峰值 378/432 TFLOPS 粗估,11.4G FLOPs 的理想 Cube 下界约 0.026-0.030ms/image;实测 FP16 speed inference 0.22ms/image、完整 val inference 0.19ms/image,差距来自真实 tile 利用率、GM 搬运、eager kernel 边界与 head 开销。端到端瓶颈明确在 CPU NMS,不是卷积主体。
 
 - 算子回退清单:
-  - `torchvision.ops.nms`:当前不可用,使用 CPU fallback。功能不阻塞,mAP 可复现;端到端性能被严重限制。
+  - `torchvision.ops.nms`:CPU/Meta kernel 可用,NPU kernel 不存在;NPU 张量调用触发 torch_npu CPU fallback。功能不阻塞,mAP 可复现;端到端性能被严重限制。
   - `pycocotools`:CPU 统计 AP/AR,不属于 NPU kernel 路径。
   - OpenCV/letterbox/preprocess:host 侧处理,当前耗时很小,不是主要瓶颈。
   - 训练 label assignment:标准 loss 中 `loss.preprocess()` 固定为 `float32` 后,单卡训练功能验证未再回退。`fuse_ab`、`distill` loss 未应用同类 dtype/device 修正,实测仍触发 `DT_DOUBLE`。
@@ -146,7 +146,7 @@ python tools/eval.py \
 ## 5. 阻塞项
 | 阻塞点 | 原因 | 是否硬阻塞 | CANN/AscendC 替代方案 | 兜底 |
 |---|---|---|---|---|
-| NMS CPU fallback | 当前 torch/torchvision/torch_npu 组合中 `torchvision::nms` 不可用 | 对功能不是硬阻塞;对全 NPU 端到端是硬阻塞 | 使用 Ascend 后处理算子、OM 后处理或 AscendC batched NMS;保留 class-aware 语义 | CPU NMS,可复现 mAP 但低阈值极慢 |
+| NMS CPU fallback | `torchvision::nms` CPU/Meta kernel 可用,但无 NPU dispatch kernel;torch_npu 对 NPU 张量调用回退 CPU | 对功能不是硬阻塞;对全 NPU 端到端是硬阻塞 | 使用 Ascend 后处理算子、OM 后处理或 AscendC batched NMS;保留 class-aware 语义 | CPU NMS,可复现 mAP 但低阈值极慢 |
 | 原始训练入口 CUDA 绑定 | `select_device()` 强制 CUDA;训练 loop 使用 CUDA AMP/GradScaler/empty_cache;loss 多处 `.cuda()` | 对原始 v0.4.0 NPU 训练入口是硬阻塞 | 建立统一 accelerator abstraction;NPU 默认 FP32 或 torch_npu AMP 路径 | 标准 YOLOv6-N 单卡 FP32 已通过适配验证 |
 | `fuse_ab` / `distill` loss 分支 | 分支 loss 仍产生 `DT_DOUBLE` 进入 NPU `Min`,fallback 继续调用 `.cuda()` | 对这两个训练模式是硬阻塞 | 将 `loss_fuseab.py`、`loss_distill*.py` 按标准 loss 同步 dtype/device 修正,所有 fallback tensor 回到当前 accelerator | 不启用 `fuse_ab` / `distill` 时标准训练可运行 |
 | DDP 多卡训练入口 | `LOCAL_RANK` 分支直接调用 `torch.cuda.set_device` 并设置 CUDA device,未接 HCCL/NPU device | 对多卡 NPU 训练是硬阻塞 | 将 DDP 初始化改为 `torch.npu.set_device`、NPU device、HCCL backend,并修正 DDP device_ids | 单卡 NPU 训练 |
