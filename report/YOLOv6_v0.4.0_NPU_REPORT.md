@@ -81,7 +81,7 @@ python tools/train.py \
   - 原始训练入口:使用 NPU 环境直接运行会在 `select_device()` 处因 `torch.cuda.is_available()` 为 False 触发 `AssertionError`。
   - 训练功能验证范围:标准 YOLOv6-N、单 NPU、FP32、batch size 2、image size 320、workers 0、1 epoch、8 张 train + 4 张 val。该范围只证明训练程序路径可执行,不证明全量 COCO 训练可收敛。
   - 训练功能验证结果:完成 1 epoch,4/4 step,生成 `last_ckpt.pt` 与 `best_ckpt.pt`,日志显示 `Using 1 NPU for training`、`Training completed`。已覆盖 forward、loss/assigner、backward、optimizer step、checkpoint save、final eval。
-  - 训练未覆盖范围:AMP/GradScaler、DDP/HCCL、多 epoch 稳定性、resume、distill、fuse_ab、QAT/quant、全量 COCO train2017 和训练性能 profiler 均未验证,不能据此声明完整训练适配完成。
+  - 训练未覆盖测试项:AMP/GradScaler、DDP/HCCL、多 epoch 稳定性、resume、distill、fuse_ab、QAT/quant、全量 COCO train2017 和训练性能 profiler 均未执行。本项是测试覆盖范围缺口,不是已确认阻塞;报告仅据此限制训练结论外推。
   - 训练 assigner:首次 NPU 训练补丁会在 label assignment 中因 `DT_DOUBLE` 输入触发 NPU `Min` error code `161002`,随后回退 CPU;将 `loss.preprocess()` 生成的 numpy array 固定为 `float32` 后,同一训练功能验证不再出现 `CPU mode for This Batch`。
 - 与 CPU/GPU 基准对比(误差/一致性):mAP 与 README 37.5 基准相差约 0.1 个百分点,可视为复现通过。README 的 T4 TensorRT FPS 属于 TensorRT 部署路径,本报告只对 torch_npu PyTorch 路径负责,不做横向等价比较。
 
@@ -120,12 +120,11 @@ python tools/train.py \
 | 阻塞点 | 原因 | 是否硬阻塞 | CANN/AscendC 替代方案 | 兜底 |
 |---|---|---|---|---|
 | NMS CPU fallback | 当前 torch/torchvision/torch_npu 组合中 `torchvision::nms` 不可用 | 对功能不是硬阻塞;对全 NPU 端到端是硬阻塞 | 使用 Ascend 后处理算子、OM 后处理或 AscendC batched NMS;保留 class-aware 语义 | CPU NMS,可复现 mAP 但低阈值极慢 |
-| 原始训练入口 CUDA 绑定 | `select_device()` 强制 CUDA;训练 loop 使用 CUDA AMP/GradScaler/empty_cache;loss 多处 `.cuda()` | 对 NPU 训练是硬阻塞 | 建立统一 accelerator abstraction;NPU 默认 FP32 或 torch_npu AMP 路径 | 已绕过的范围:标准 YOLOv6-N、单 NPU、FP32、1 epoch、8 train + 4 val。仍未覆盖 AMP、DDP/HCCL、resume、distill、fuse_ab、QAT/quant、全量训练和多 epoch 收敛 |
+| 原始训练入口 CUDA 绑定 | `select_device()` 强制 CUDA;训练 loop 使用 CUDA AMP/GradScaler/empty_cache;loss 多处 `.cuda()` | 对原始 v0.4.0 NPU 训练入口是硬阻塞 | 建立统一 accelerator abstraction;NPU 默认 FP32 或 torch_npu AMP 路径 | 已绕过的范围:标准 YOLOv6-N、单 NPU、FP32、1 epoch、8 train + 4 val |
 | 训练 assigner double tensor | `loss.preprocess()` 的 numpy array 默认为 float64,NPU `Min` 不支持 DT_DOUBLE | 对纯 NPU label assignment 是硬阻塞 | 固定 label preprocess 为 float32;后续对 assigner 做 dtype 单测 | 在上述单卡 FP32 功能验证范围内未再 CPU fallback;未证明所有训练配置下均无 fallback |
 | head 末端 layout 与小 kernel | reshape/permute/cat/dist2bbox/NMS prep 在 eager 下产生多段小算子与物化 | 非硬阻塞 | 固定 `(N, HW, C)` 物理布局,用 NDDMA/address generation 折叠转换,将 decode 融入后处理 | 继续 eager 执行 |
 | 旧权重序列化结构 | 官方权重保存旧 class/属性,直接用 v0.4.0 代码加载会失败 | 非硬阻塞,已用兼容 shim 解决 | 重新导出标准 state_dict 或 ONNX,减少 Python class 依赖 | 保留兼容 shim |
 | 全模型矩阵未补齐 | 本轮完整 COCO val 只跑 YOLOv6-N | 非硬阻塞 | 逐个补 YOLOv6-S/M/L 与 P6 1280 输入;采集 profiler | 当前只声明 YOLOv6-N |
-| 训练分支未补齐 | 本轮只跑标准 YOLOv6-N、单 NPU、FP32、1 epoch、8 train + 4 val | 非硬阻塞,但限制训练结论 | 补 AMP、DDP/HCCL、distill、fuse_ab、QAT/quant、resume、全量 COCO train2017 和多 epoch 稳定性测试 | 当前只能声明上述限定功能验证通过,不能声明完整训练适配 |
 | HBM/利用率未 profile | npu-smi 未采稳定利用率曲线 | 非硬阻塞 | STARS/torch_npu profiler 采 AIC/AIV/MTE、kernel timeline、HBM 峰值 | 用日志三段耗时做初判 |
 
 ## 6. 结论
@@ -136,5 +135,5 @@ python tools/train.py \
   - 补 STARS/torch_npu profiler,确认 Cube/Vector/MTE/host/head 实际占比、训练 backward/assigner 热点与 HBM 峰值。
   - 补 FP16 COCO mAP,当前 FP16 只跑了 speed。
   - 补 YOLOv6-S/M/L 和 P6 1280 输入矩阵,不能把 YOLOv6-N 结果外推到全系列。
-  - 补 DDP/HCCL、distill、fuse_ab、QAT/quant、resume 训练分支;这些路径仍有 CUDA 绑定,不能由本轮单卡 FP32 功能验证外推。
+  - 补测 AMP/GradScaler、DDP/HCCL、resume、distill、fuse_ab、QAT/quant、全量 COCO train2017 和多 epoch 稳定性。本轮未执行这些训练分支,因此只能记录为未覆盖测试项,不能写成已确认阻塞。
   - 若目标是生产部署,应走 ONNX -> ATC/OM 或 Ascend 原生后处理路径,验证 CV fusion、NDDMA layout folding 与 NPU NMS。
