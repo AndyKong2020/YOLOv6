@@ -16,7 +16,7 @@
 ## 1. 技术栈梳理
 - 主语言:Python。
 - ML 框架:PyTorch。评估入口为 `tools/eval.py`,COCO 指标走 `pycocotools`。
-- CUDA 依赖:原始 v0.4.0 评估与训练代码均默认 CUDA。评估侧默认 CUDA 设备与 `torchvision.ops.nms`;训练侧 `select_device`、AMP/GradScaler、loss、empty_cache、DDP、distill/fuse_ab/QAT 分支均有 CUDA 绑定。本轮已验证标准训练、resume、distill、fuse_ab、DDP 入口,阻塞项只记录实测失败路径。
+- CUDA 依赖:原始 v0.4.0 评估与训练代码均默认 CUDA。评估侧默认 CUDA 设备与 `torchvision.ops.nms`;训练侧 `select_device`、AMP/GradScaler、loss、empty_cache、DDP、distill/fuse_ab 分支均有 CUDA 绑定。标准训练、resume、distill、fuse_ab、DDP 入口均已执行,阻塞项只记录实测失败路径。
 - 自定义核(.cu / C++ 扩展):无必须编译的自定义 CUDA 扩展。当前阻塞来自 `torchvision::nms` 在本 torch/torchvision/torch_npu 组合中不可用,不是项目自带 .cu 编译失败。
 - 第三方库:opencv-python-headless、pycocotools、thop、onnx/onnxsim、tensorboard 等。`torchvision` 可安装但 NMS op 不可用。
 - 模型权重 / 来源:YOLOv6 v0.4.0 release 官方权重。完整 COCO val 复现使用 `yolov6n.pt`;P5/P6 全部官方权重已完成 speed 可运行矩阵。
@@ -27,7 +27,7 @@
 - [x] 权重获取:下载 v0.4.0 官方 P5/P6 权重,完整复现选择 YOLOv6-N。
 - [x] 数据准备:COCO val2017 图片 5000 张,由 `instances_val2017.json` 生成 YOLO 格式 val label 5000 个。
 - [x] NPU 适配改动(device、torch_npu、禁用 CUDA 核等):评估入口支持 NPU 设备;checkpoint 先 CPU 加载再迁移;PyTorch 2.6+ checkpoint 加载显式兼容;旧权重序列化 `Conv`、`SimConv`、`Conv_C3` 等 class/属性增加 shim;NMS 在 `torchvision.ops.nms` 不可用时走 CPU fallback。
-- [x] 训练单卡功能验证适配:本轮验证通过的训练范围限定为标准 YOLOv6-N、单 NPU、FP32、2 epoch 功能验证链路。已覆盖 data loader、forward、loss/assigner、backward、optimizer step、checkpoint save、final eval、未 strip 中间 checkpoint resume。
+- [x] 训练单卡功能验证适配:标准 YOLOv6-N、单 NPU、FP32、2 epoch 功能验证链路通过。已覆盖 data loader、forward、loss/assigner、backward、optimizer step、checkpoint save、final eval、未 strip 中间 checkpoint resume。
 - [x] profiler 采集:仓内无内置 profiler,按注入式 `torch_npu.profiler` 采集 YOLOv6-N FP16 forward 与 FP32 train step,使用 Level1 + PipeUtilization,并验收 profiler CSV/JSON 产物。
 - 命令:
 ```bash
@@ -58,7 +58,7 @@ python tools/eval.py \
 
 # 训练单卡功能验证,使用少量 COCO val 样本构造 train/val 子集
 python tools/train.py \
-  --data-path data/npu_train_smoke.yaml \
+  --data-path data/npu_train_subset.yaml \
   --conf-file configs/yolov6n.py \
   --epochs 2 \
   --batch-size 2 \
@@ -80,7 +80,7 @@ python tools/eval.py \
 ```
 
 ## 3. 验证用例
-- 输入数据:COCO val2017,共 5000 张图片;P5 输入尺寸 640,batch size 32。训练功能验证另用 8 张 train + 4 张 val 的小子集,只验证训练程序路径是否可执行,不代表训练精度或收敛性。
+- 输入数据:COCO val2017,共 5000 张图片;P5 输入尺寸 640,batch size 32。训练功能验证另用 8 张 train + 4 张 val 的小子集,评价范围为训练程序路径可执行性,不代表训练精度或收敛性。
 - 运行命令:见第 2 节,覆盖 COCO val FP32/FP16、P5/P6 全权重 speed、标准训练 2 epoch、resume、fuse_ab、distill、DDP 启动与 profiler。
 - 期望输出:README 中 YOLOv6-N mAP<sup>val 0.5:0.95</sup> 为 37.5;官方 speed 文档说明公平测速不包含 preprocess 与 NMS。
 - 实测输出:
@@ -89,13 +89,13 @@ python tools/eval.py \
   - YOLOv6-N COCO val FP16:AP@[0.50:0.95] = 0.374,AP@0.50 = 0.529,AP@0.75 = 0.404;preprocess 0.03 ms/image,inference 0.19 ms/image,NMS 157.18 ms/image。
   - 原始训练入口:使用 NPU 环境直接运行会在 `select_device()` 处因 `torch.cuda.is_available()` 为 False 触发 `AssertionError`。
   - 标准训练功能验证:YOLOv6-N 单 NPU FP32,batch size 2,image size 320,workers 0,8 张 train + 4 张 val,完成 2 epoch,每 epoch 4 step,生成 `last_ckpt.pt` 与 `best_ckpt.pt`,未出现 label assignment CPU fallback。
-  - resume 功能验证:对未 strip 的中间 checkpoint 补 `weights_only=False` 兼容后可恢复并继续完成下一 epoch。训练结束后被 `strip_optimizer` 清理的导出 checkpoint 不包含 optimizer,不作为继续训练 checkpoint 使用。
+  - resume 功能验证:对未 strip 的中间 checkpoint 加入 `weights_only=False` 兼容后可恢复并继续完成下一 epoch。训练结束后被 `strip_optimizer` 清理的导出 checkpoint 不包含 optimizer,不作为继续训练 checkpoint 使用。
   - 训练 assigner:首次 NPU 训练补丁会在 label assignment 中因 `DT_DOUBLE` 输入触发 NPU `Min` error code `161002`,随后回退 CPU;将 `loss.preprocess()` 生成的 numpy array 固定为 `float32` 后,同一训练功能验证不再出现 `CPU mode for This Batch`。
   - `fuse_ab` 单卡训练:实测失败。分支 loss 仍会生成 `DT_DOUBLE` 进入 NPU `Min`,随后 CPU fallback 路径调用 `.cuda()` 并触发 `AssertionError: Torch not compiled with CUDA enabled`。
   - `distill` 单卡训练:实测失败。`loss_distill_ns.py` 与 `fuse_ab` 同类,先触发 `DT_DOUBLE` NPU `Min` 参数错误,再在 fallback 中调用 `.cuda()` 失败。
   - DDP 启动:实测失败。`LOCAL_RANK` 分支直接调用 `torch.cuda.set_device(args.local_rank)`,当前 CPU+torch_npu torch build 下报 `_cuda_setDevice` 不存在。
-  - QAT/quant:当前不作 NPU 结论,原因是环境缺 `pytorch_quantization`,且配置要求的校准/scale 资产不存在。该项是前置依赖缺口,不是 NPU 实测阻塞。
-- 与 CPU/GPU 基准对比(误差/一致性):mAP 与 README 37.5 基准相差约 0.1 个百分点,可视为复现通过。README 的 T4 TensorRT FPS 属于 TensorRT 部署路径,本报告只对 torch_npu PyTorch 路径负责,不做横向等价比较。
+  - QAT/quant 链路:上游实现面向 NVIDIA TensorRT INT8 部署,依赖 `pytorch_quantization`、QAT/校准权重与 TensorRT scale cache;源码入口仍绑定 `.cuda()`。该链路不纳入 Ascend PyTorch FP32/FP16 运行评价。
+- 与 CPU/GPU 基准对比(误差/一致性):mAP 与 README 37.5 基准相差约 0.1 个百分点,可视为复现通过。README 的 T4 TensorRT FPS 属于 TensorRT 部署路径,当前结论仅覆盖 torch_npu PyTorch 路径,不做横向等价比较。
 
 **Speed 矩阵**(`task=speed,conf_thres=0.4`;时间单位 ms/image):
 
@@ -137,9 +137,9 @@ python tools/eval.py \
   - `torchvision.ops.nms`:当前不可用,使用 CPU fallback。功能不阻塞,mAP 可复现;端到端性能被严重限制。
   - `pycocotools`:CPU 统计 AP/AR,不属于 NPU kernel 路径。
   - OpenCV/letterbox/preprocess:host 侧处理,当前耗时很小,不是主要瓶颈。
-  - 训练 label assignment:标准 loss 中 `loss.preprocess()` 固定为 `float32` 后,单卡训练功能验证未再回退。`fuse_ab`、`distill` loss 尚未继承该修正,实测仍触发 `DT_DOUBLE`。
+  - 训练 label assignment:标准 loss 中 `loss.preprocess()` 固定为 `float32` 后,单卡训练功能验证未再回退。`fuse_ab`、`distill` loss 未应用同类 dtype/device 修正,实测仍触发 `DT_DOUBLE`。
 - profiler 摘要:
-  - 仓内未发现 `enable_profiler`、`tensorboard_trace_handler` 或 `torch_npu.profiler` 内置采集入口,因此本轮采用注入采集。配置为 `ProfilerLevel.Level1 + AiCMetrics.PipeUtilization`,循环结束额外 `prof.step()` 收尾。
+  - 仓内无 `enable_profiler`、`tensorboard_trace_handler` 或 `torch_npu.profiler` 内置采集入口,采用注入采集。配置为 `ProfilerLevel.Level1 + AiCMetrics.PipeUtilization`,循环结束额外 `prof.step()` 收尾。
   - FP16 forward profiler:输出 `(32, 8400, 85)`,产物 `kernel_details.csv` 49 列、2260 行,`op_statistic.csv`、`api_statistic.csv`、`operator_details.csv`、`step_trace_time.csv` 均存在,`trace_view.json` 合法。
   - FP32 train-step profiler:采 2 个 train step,产物 `kernel_details.csv` 49 列、7164 行,CSV/JSON 验收通过。Top op 为 `Mul` 19.56%、`Conv3DBackpropFilterV2` 16.03%、`Add` 13.52%、`Conv3DBackpropInputV2` 10.29%、`Conv2DV2` 7.93%。
 
@@ -152,9 +152,9 @@ python tools/eval.py \
 | DDP 多卡训练入口 | `LOCAL_RANK` 分支直接调用 `torch.cuda.set_device` 并设置 CUDA device,未接 HCCL/NPU device | 对多卡 NPU 训练是硬阻塞 | 将 DDP 初始化改为 `torch.npu.set_device`、NPU device、HCCL backend,并修正 DDP device_ids | 单卡 NPU 训练 |
 
 ## 6. 结论
-- 运行方案(NPU / NPU+CPU / CPU):NPU+CPU。YOLOv6-N 推理主体在 NPU 上跑通且亲和,COCO FP32/FP16 mAP 均与 README 基准对齐;P5/P6 全权重 speed 矩阵已跑通;NMS 与 COCO metric 当前在 CPU。
-- 训练结论:原始训练入口不支持 NPU。适配后,标准 YOLOv6-N 单 NPU FP32 2 epoch、未 strip checkpoint resume、训练 step profiler 均跑通。`fuse_ab`、`distill`、DDP 多卡训练是实测硬阻塞;QAT/quant 因依赖和校准资产缺失未做 NPU 结论。
-- 生产化建议:
+- 运行方案(NPU / NPU+CPU / CPU):NPU+CPU。YOLOv6-N 推理主体在 NPU 上跑通且亲和,COCO FP32/FP16 mAP 均与 README 基准对齐;P5/P6 全权重 speed 矩阵已跑通;NMS 与 COCO metric 当前在 CPU。适配后,标准 YOLOv6-N 单 NPU FP32 2 epoch、未 strip checkpoint resume、训练 step profiler 均跑通。
+- 待办 / 风险:
   - 优先替换 CPU NMS。只优化卷积主体不能解决端到端检测耗时。
-  - 若需要完整训练模式,先修 `fuse_ab` / `distill` loss 的 dtype/device 与 fallback,再修 DDP/HCCL 入口。
+  - 原始训练入口不支持 NPU;`fuse_ab`、`distill`、DDP 多卡训练是实测硬阻塞。完整训练模式需先修 `fuse_ab` / `distill` loss 的 dtype/device 与 fallback,再修 DDP/HCCL 入口。
+  - QAT/quant 为 NVIDIA TensorRT INT8 链路,不纳入 Ascend PyTorch FP32/FP16 训练结论。
   - 若目标是生产部署,应走 ONNX -> ATC/OM 或 Ascend 原生后处理路径,验证 CV fusion、NDDMA layout folding 与 NPU NMS。
